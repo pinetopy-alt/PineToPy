@@ -30,14 +30,16 @@ if st.button("Convert to Python"):
         code = code.replace("ta.wma(close,", "close.rolling(window=")
         code = re.sub(r'ta\.rsi\(close,\s*(\d+)\)', r'RSI(close, \1)', code)
         code = re.sub(r'ta\.atr\(\s*(\d+)\)', r'ATR(high, low, close, \1)', code)
-        code = re.sub(r'ta\.highest\(close,\s*(\d+)\)', r'close.rolling(window=\1).max()', code)
-        code = re.sub(r'ta\.lowest\(close,\s*(\d+)\)', r'close.rolling(window=\1).min()', code)
         code = re.sub(r'ta\.change\(close\)', r'close.diff()', code)
         code = re.sub(r'ta\.mom\(close,\s*(\d+)\)', r'close.diff(\1)', code)
 
         # Fix rolling / ewm
         code = re.sub(r'close\.rolling\(window=\s*(\d+)\)', r'close.rolling(window=\1).mean()', code)
         code = re.sub(r'close\.ewm\(span=\s*(\d+)\)', r'close.ewm(span=\1, adjust=False).mean()', code)
+
+        # highest / lowest AFTER rolling fix - so no .mean() added
+        code = re.sub(r'ta\.highest\(close,\s*(\d+)\)', r'close.rolling(window=\1).max()', code)
+        code = re.sub(r'ta\.lowest\(close,\s*(\d+)\)', r'close.rolling(window=\1).min()', code)
 
         # request.security
         code = re.sub(r'request\.security\(.*?\)', '# request.security - load data separately', code)
