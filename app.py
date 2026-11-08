@@ -24,25 +24,24 @@ if st.button("Convert to Python"):
         code = re.sub(r'input\.int\(\s*(\d+).*?\)', r'\1', code)
         code = re.sub(r'input\.float\(\s*([\d\.]+).*?\)', r'\1', code)
 
-        # TA functions
+        # TA functions - now accept variables too, not just numbers
         code = code.replace("ta.sma(close,", "close.rolling(window=")
         code = code.replace("ta.ema(close,", "close.ewm(span=")
         code = code.replace("ta.wma(close,", "close.rolling(window=")
-        code = re.sub(r'ta\.rsi\(close,\s*(\d+)\)', r'RSI(close, \1)', code)
-        code = re.sub(r'ta\.atr\(\s*(\d+)\)', r'ATR(high, low, close, \1)', code)
+        code = re.sub(r'ta\.rsi\(close,\s*([^\)]+)\)', r'RSI(close, \1)', code)
+        code = re.sub(r'ta\.atr\(\s*([^\)]+)\)', r'ATR(high, low, close, \1)', code)
         code = re.sub(r'ta\.change\(close\)', r'close.diff()', code)
-        code = re.sub(r'ta\.mom\(close,\s*(\d+)\)', r'close.diff(\1)', code)
-        # MACD + BB - added back
-        code = re.sub(r'ta\.macd\(close,\s*(\d+),\s*(\d+),\s*(\d+)\)', r'MACD(close, \1, \2, \3)', code)
-        code = re.sub(r'ta\.bb\(close,\s*(\d+),\s*(\d+)\)', r'BB(close, \1, \2)', code)
+        code = re.sub(r'ta\.mom\(close,\s*([^\)]+)\)', r'close.diff(\1)', code)
+        code = re.sub(r'ta\.macd\(close,\s*([^,]+),\s*([^,]+),\s*([^\)]+)\)', r'MACD(close, \1, \2, \3)', code)
+        code = re.sub(r'ta\.bb\(close,\s*([^,]+),\s*([^\)]+)\)', r'BB(close, \1, \2)', code)
 
-        # Fix rolling / ewm
-        code = re.sub(r'close\.rolling\(window=\s*(\d+)\)', r'close.rolling(window=\1).mean()', code)
-        code = re.sub(r'close\.ewm\(span=\s*(\d+)\)', r'close.ewm(span=\1, adjust=False).mean()', code)
+        # Fix rolling / ewm - accept numbers AND variables
+        code = re.sub(r'close\.rolling\(window=\s*([^\)]+)\)', r'close.rolling(window=\1).mean()', code)
+        code = re.sub(r'close\.ewm\(span=\s*([^\)]+)\)', r'close.ewm(span=\1, adjust=False).mean()', code)
 
         # highest / lowest AFTER rolling fix
-        code = re.sub(r'ta\.highest\(close,\s*(\d+)\)', r'close.rolling(window=\1).max()', code)
-        code = re.sub(r'ta\.lowest\(close,\s*(\d+)\)', r'close.rolling(window=\1).min()', code)
+        code = re.sub(r'ta\.highest\(close,\s*([^\)]+)\)', r'close.rolling(window=\1).max()', code)
+        code = re.sub(r'ta\.lowest\(close,\s*([^\)]+)\)', r'close.rolling(window=\1).min()', code)
 
         # request.security
         code = re.sub(r'request\.security\(.*?\)', '# request.security - load data separately', code)
@@ -72,7 +71,7 @@ if st.button("Convert to Python"):
         code = re.sub(r'label\.new\(.*\)', '# label.new', code)
         code = re.sub(r'line\.new\(.*\)', '# line.new', code)
 
-        # bool / na / color - FIX: use word boundary so signal is not broken
+        # bool / na / color - word boundary so signal is not broken
         code = code.replace("true", "True").replace("false", "False")
         code = re.sub(r'\bna\b', 'None', code)
         code = re.sub(r'color\.\w+', 'blue', code)
