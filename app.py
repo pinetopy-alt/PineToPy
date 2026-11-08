@@ -18,10 +18,9 @@ if st.button("Convert to Python"):
         code = code.replace("ta.ema(close,", "close.ewm(span=")
         code = code.replace("ta.rsi(close,", "RSI_PLACEHOLDER(")
 
-        # Fix rolling - add .mean() and close paren
-        # sma: close.rolling(window=9) -> close.rolling(window=9).mean()
-        code = re.sub(r'close\.rolling\(window=(\d+)\)', r'close.rolling(window=\1).mean()', code)
-        code = re.sub(r'close\.ewm\(span=(\d+)\)', r'close.ewm(span=\1, adjust=False).mean()', code)
+        # Fix rolling - add .mean() - handles space like window= 9
+        code = re.sub(r'close\.rolling\(window=\s*(\d+)\)', r'close.rolling(window=\1).mean()', code)
+        code = re.sub(r'close\.ewm\(span=\s*(\d+)\)', r'close.ewm(span=\1, adjust=False).mean()', code)
 
         # indicator -> comment
         code = re.sub(r'indicator\(.*?\)', '# Indicator', code)
@@ -46,23 +45,4 @@ if st.button("Convert to Python"):
         # true/false
         code = code.replace("true", "True").replace("false", "False")
         # color.blue etc
-        code = re.sub(r'color\.\w+', '"blue"', code)
-        code = code.replace("overlay=true", "overlay=True")
-
-        # if (condition) -> if condition:
-        code = re.sub(r'if\s*\((.*?)\)\s*', r'if \1:\n    ', code)
-
-        header = """# Converted by PineToPy
-import pandas as pd
-import numpy as np
-
-# Assume you have a DataFrame 'df' with 'close' column
-# Example: df = pd.read_csv('data.csv')
-# close = df['close']
-
-"""
-
-        final_code = header + code
-        st.success("Converted!")
-        st.code(final_code, language="python")
-        st.download_button("Download .py file", final_code, file_name="converted.py")
+        code = re
