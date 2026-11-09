@@ -1,0 +1,192 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strategy Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="logo">Strategy<span>Lab</span></div>
+  <nav>
+    <button data-tab="test" class="on">Test</button>
+    <button data-tab="replay">Visual</button>
+    <button data-tab="ide">Strategies</button>
+    <button data-tab="data">Data</button>
+    <button data-tab="history">History</button>
+  </nav>
+</header>
+
+<main>
+  <div id="msg" class="msg" hidden></div>
+
+  <!-- TEST -->
+  <section id="view-test" class="view">
+    <div class="layout">
+      <form id="form" class="card" autocomplete="off">
+        <h3>Setup</h3>
+        <label for="ds">Price data</label>
+        <select id="ds" required></select>
+
+        <label for="strat">Strategy</label>
+        <select id="strat"></select>
+        <div class="hint"><a href="#" id="edit-code">Edit this strategy's code</a></div>
+
+        <div id="params"></div>
+
+        <div class="row2">
+          <div>
+            <label for="cost">Cost per trade</label>
+            <input id="cost" type="number" min="0" max="1000" step="any" value="0.35">
+          </div>
+          <div>
+            <label for="split">In-sample <b id="splitv">70</b>%</label>
+            <input id="split" type="range" min="50" max="90" step="5" value="70">
+          </div>
+        </div>
+        <div class="hint">Cost = spread + slippage in price units (gold 0.35 = $0.35; EURUSD 0.00015 = 1.5 pips). It fills in a typical value when you pick data: replace it with your broker's real spread.</div>
+
+        <label>Test type</label>
+        <label class="radio"><input type="radio" name="mode" value="validate" checked>
+          <span><b>Full validation</b> (recommended)<small>Searches the strategy's settings grid on in-sample data, tests the winner once on unseen data, applies strict checks.</small></span></label>
+        <label class="radio"><input type="radio" name="mode" value="quick">
+          <span><b>Quick test</b><small>One settings set, in-sample vs out-of-sample. Informational only.</small></span></label>
+
+        <button class="btn" id="run" type="submit">Run test</button>
+      </form>
+      <div id="result"><div class="card empty">Pick data and a strategy, then run a test.<br>Results appear here.</div></div>
+    </div>
+  </section>
+
+  <!-- VISUAL REPLAY -->
+  <section id="view-replay" class="view" hidden>
+    <div class="card rp-top">
+      <label for="rp-run" style="margin:0">Test to replay</label>
+      <select id="rp-run"></select>
+      <span id="rp-title" class="muted"></span>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <canvas id="rp-chart"></canvas>
+      <div class="legend" id="rp-legend"></div>
+      <input id="rp-scrub" type="range" min="0" max="0" value="0" aria-label="Position">
+      <div class="rp-controls">
+        <button class="btn ghost sm" id="rp-start" title="Back to the start">⏮</button>
+        <button class="btn ghost sm" id="rp-prev" title="Previous trade (P)">⏪ Trade</button>
+        <button class="btn sm" id="rp-play" title="Play / pause (Space)">▶ Play</button>
+        <button class="btn ghost sm" id="rp-next" title="Next trade (N)">Trade ⏩</button>
+        <button class="btn ghost sm" id="rp-step" title="One bar forward (→)">+1 bar</button>
+        <button class="btn ghost sm" id="rp-oos" title="Jump to where out-of-sample data begins">Out-of-sample ⏭</button>
+        <span class="grow"></span>
+        <label class="inl">Speed
+          <select id="rp-speed">
+            <option value="2">2 bars/s</option><option value="10">10 bars/s</option>
+            <option value="30" selected>30 bars/s</option><option value="100">100 bars/s</option>
+            <option value="300">300 bars/s</option><option value="1000">1000 bars/s</option>
+          </select></label>
+        <label class="inl">Zoom
+          <select id="rp-win">
+            <option value="60">60 bars</option><option value="120" selected>120 bars</option>
+            <option value="240">240 bars</option><option value="480">480 bars</option>
+          </select></label>
+      </div>
+    </div>
+    <div class="rp-bottom">
+      <div class="card"><h3>Equity so far (R)</h3><canvas id="rp-eq"></canvas></div>
+      <div class="card" id="rp-info"></div>
+    </div>
+    <div class="note">This replays the exact trades the test produced, bar by bar. Shortcuts: Space play/pause, ← → step, N / P next / previous trade.</div>
+  </section>
+
+  <!-- STRATEGIES (IDE) -->
+  <section id="view-ide" class="view" hidden>
+    <div class="ide">
+      <aside class="card">
+        <h3>Your strategies</h3>
+        <div id="slist"></div>
+        <h3 style="margin-top:18px">New from template</h3>
+        <select id="tpl"></select>
+        <button class="btn ghost" id="tpl-new" type="button" style="margin-top:8px;width:100%">Create</button>
+      </aside>
+      <div>
+        <div class="card ide-bar">
+          <input id="sname" type="text" maxlength="60" placeholder="Strategy name" aria-label="Strategy name">
+          <span id="dirty" class="dirty" hidden>● unsaved</span>
+          <button class="btn ghost sm" id="b-save" type="button" title="Ctrl+S">Save</button>
+          <button class="btn ghost sm" id="b-check" type="button" title="Ctrl+Enter">Check code</button>
+          <button class="btn sm" id="b-run" type="button">Test it ▶</button>
+          <button class="btn ghost sm danger" id="b-del" type="button">Delete</button>
+        </div>
+        <div class="card editor">
+          <div class="gutter" id="gutter"></div>
+          <div class="codewrap">
+            <pre id="hl" aria-hidden="true"><code></code></pre>
+            <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" aria-label="Strategy code"></textarea>
+          </div>
+        </div>
+        <div class="card" id="ide-out"><span class="muted">Press <b>Check code</b> (Ctrl+Enter) to test your code on a slice of real data.</span></div>
+        <details class="card" id="help">
+          <summary>How to write a strategy</summary>
+          <div class="doc">
+            <p>A strategy is a Python function <code>signals(df, p)</code>. <code>df</code> holds the candles (columns <code>open high low close</code>, indexed by time). <code>p</code> holds your settings. Return a dict of per-bar values:</p>
+            <ul>
+              <li><code>side</code>: +1 buy, -1 sell, 0 nothing, for every bar</li>
+              <li><code>sl</code>: stop distance in price units (must be above 0 where there is a signal)</li>
+              <li><code>tp</code>: target distance in price units, or 0 for no fixed target</li>
+            </ul>
+            <p>A signal on a bar means: that bar has CLOSED, enter at the NEXT bar's open. One trade at a time. Profit is measured in <b>R</b>, multiples of the stop distance, after your cost.</p>
+            <p><b>Settings</b>: <code>PARAMS = {"length": {"default": 20, "min": 2, "max": 200, "grid": [10, 20, 40]}}</code>. Full validation tries every value in each <code>grid</code> and keeps the one that did best on the in-sample part only.</p>
+            <p><b>Optional</b>: <code>MAX_HOLD</code> (bars before a trade is closed at market), <code>WARMUP</code> (bars to skip at the start), <code>valid(p)</code> (return False to skip a combination), <code>plots(df, p)</code> (return a dict of lines to draw on the Visual chart).</p>
+            <p><b>Ready to use</b>: <code>np</code>, <code>pd</code>, <code>ema(s, n)</code>, <code>sma(s, n)</code>, <code>atr(df, n)</code>, <code>rsi(s, n)</code>, <code>highest(s, n)</code>, <code>lowest(s, n)</code>, <code>crossover(a, b)</code>, <code>crossunder(a, b)</code>. <code>print()</code> output appears under your results.</p>
+            <p><b>The no-peeking rule</b>: only use data up to each bar. <code>shift(-1)</code>, <code>df["close"].max()</code> over the whole series and centered rolling windows all use the future. The tester re-runs your code with later bars hidden and fails the strategy if any signal changes.</p>
+            <p>Your code runs on your own computer, so only paste code you trust.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- DATA LIBRARY -->
+  <section id="view-data" class="view" hidden>
+    <h2>Data library</h2>
+    <p class="sub">One entry per symbol and timeframe. Upload more files for the same symbol and timeframe to add more years: they merge automatically.</p>
+    <div class="layout">
+      <form id="upload" class="card">
+        <h3>Add data</h3>
+        <label for="up-file">CSV files (select several at once)</label>
+        <input id="up-file" type="file" accept=".csv,.txt,text/csv" multiple required>
+        <div class="row2">
+          <div><label for="up-symbol">Symbol</label>
+            <input id="up-symbol" type="text" maxlength="20" placeholder="auto" list="symlist"></div>
+          <div><label for="up-tf">Timeframe</label>
+            <select id="up-tf"><option value="">auto</option><option>M1</option><option>M5</option><option>M15</option><option>M30</option><option>H1</option><option>H4</option><option>D1</option><option>W1</option></select></div>
+        </div>
+        <datalist id="symlist"><option>XAUUSD</option><option>EURUSD</option><option>GBPUSD</option><option>USDJPY</option><option>AUDUSD</option><option>USDCAD</option><option>USDCHF</option><option>NZDUSD</option><option>BTCUSD</option><option>US30</option><option>NAS100</option><option>XAGUSD</option></datalist>
+        <div class="hint">Leave both on "auto": the symbol is read from the file name (MT5 names like XAUUSD_H1_….csv work) and the timeframe from the bar spacing.</div>
+        <button class="btn" type="submit">Upload</button>
+        <div id="upmsg"></div>
+        <hr style="border:0;border-top:1px solid var(--line);margin:18px 0">
+        <h3>Sanity-check data</h3>
+        <div class="hint" style="margin:0 0 10px">Random prices with no real edge. A good tester must say "no edge" here.</div>
+        <button class="btn ghost" id="synth" type="button">Add random-walk data</button>
+      </form>
+      <div class="card xscroll"><div id="datasets"></div></div>
+    </div>
+  </section>
+
+  <!-- HISTORY -->
+  <section id="view-history" class="view" hidden>
+    <h2>History</h2>
+    <p class="sub">Every test you run is saved here, together with the strategy code that produced it.</p>
+    <div class="card xscroll"><div id="history"></div></div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+<script src="/static/ide.js"></script>
+<script src="/static/replay.js"></script>
+<script>boot();</script>
+</body>
+</html>
