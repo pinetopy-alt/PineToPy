@@ -1,4 +1,5 @@
 /* Strategy Lab front end: shared helpers, Test, Data and History tabs. */
+/* Pine tab is wired here, but converter itself lives in pine.js (works offline). */
 "use strict";
 
 const S = {datasets: [], strategies: [], runs: [], run: null};
@@ -26,7 +27,7 @@ async function api(path, opts = {}) {
   try {
     r = await fetch(path, o);
   } catch (e) {
-    throw Object.assign(new Error("Cannot reach the Strategy Lab server. Is the terminal window still running?"), {data: {}});
+    throw Object.assign(new Error("Cannot reach the Strategy Lab server. Is the terminal window still running? Pine converter still works offline - use Copy / Download."), {data: {}});
   }
   let data = {};
   try { data = await r.json(); } catch (e) { /* not json */ }
@@ -37,6 +38,7 @@ async function api(path, opts = {}) {
 let msgTimer = null;
 function note(text, ok) {
   const m = $("msg");
+  if (!m) return;
   m.textContent = text;
   m.className = "msg" + (ok ? " ok" : "");
   m.hidden = !text;
@@ -48,16 +50,17 @@ function note(text, ok) {
 /* ---------- tabs ---------- */
 let TAB = "test";
 function show(tab) {
-  if (TAB === "replay" && tab !== "replay" && Replay) Replay.pause();
+  if (TAB === "replay" && tab !== "replay" && typeof Replay !== "undefined" && Replay) Replay.pause();
   TAB = tab;
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
   document.querySelectorAll(".view").forEach((v) => (v.hidden = v.id !== "view-" + tab));
-  $("msg").hidden = true;
-  if (tab === "history") loadHistory();
-  if (tab === "data") loadDatasets();
-  if (tab === "replay" && Replay) Replay.enter();
-  if (tab === "ide" && IDE) IDE.enter();
-  if (tab === "test") { refreshStrategies(); }
+  const m = $("msg"); if (m) m.hidden = true;
+  if (tab === "history") loadHistory().catch((e) => note(e.message));
+  if (tab === "data") loadDatasets().catch((e) => note(e.message));
+  if (tab === "replay" && typeof Replay !== "undefined" && Replay) Replay.enter();
+  if (tab === "ide" && typeof IDE !== "undefined" && IDE) IDE.enter();
+  if (tab === "pine" && typeof PineUI !== "undefined" && PineUI) PineUI.enter();
+  if (tab === "test") { refreshStrategies().catch(()=>{}); }
 }
 
 /* ---------- charts ---------- */
@@ -300,46 +303,4 @@ async function doUpload(ev) {
     fd.append("symbol", $("up-symbol").value);
     fd.append("timeframe", $("up-tf").value);
     try {
-      const r = await api("/api/datasets", {method: "POST", body: fd});
-      line.innerHTML = `<span class="pos">✓</span> ${esc(f.name)} → <b>${esc(r.symbol)} ${esc(r.timeframe)}</b>: ` +
-        (r.merged ? `${r.added.toLocaleString()} new bars added (now ${r.total.toLocaleString()})` : `${r.total.toLocaleString()} bars saved`);
-    } catch (e) {
-      line.innerHTML = `<span class="neg">✗</span> ${esc(f.name)}: ${esc(e.message)}`;
-    }
-  }
-  btn.disabled = false;
-  $("up-file").value = "";
-  loadDatasets();
-}
-
-async function addSynthetic() {
-  const seed = 1 + Math.floor(Math.random() * 9999);
-  try {
-    const r = await api("/api/datasets/synthetic", {method: "POST", json: {seed}});
-    note("Added " + r.symbol + " (" + r.total.toLocaleString() + " random bars).", true);
-    loadDatasets();
-  } catch (e) { note(e.message); }
-}
-
-/* ---------- boot ---------- */
-async function boot() {
-  document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => show(b.dataset.tab)));
-  $("form").onsubmit = doRun;
-  $("strat").onchange = renderParams;
-  $("ds").onchange = applyCost;
-  $("cost").oninput = () => ($("cost").dataset.touched = "1");
-  $("split").oninput = () => ($("splitv").textContent = $("split").value);
-  $("upload").onsubmit = doUpload;
-  $("synth").onclick = addSynthetic;
-  $("edit-code").onclick = async (e) => { e.preventDefault(); await IDE.openStrategy(Number($("strat").value)); show("ide"); };
-  window.addEventListener("resize", () => {
-    if (S.run && TAB === "test" && $("curve")) drawCurve($("curve"), S.run.result.curve, S.run.result.curve.filter((p) => p[3] === 0).length || null);
-    if (TAB === "replay" && Replay) Replay.draw();
-  });
-  IDE.init();
-  Replay.init();
-  try {
-    await refreshDatasets();
-    await refreshStrategies();
-  } catch (e) { note(e.message); }
-}
+      const r = await api("/api/datasets", {method
