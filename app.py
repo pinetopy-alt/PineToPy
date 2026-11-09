@@ -1,456 +1,386 @@
-import streamlit as st
-import re
-import pandas as pd
-import numpy as np
-import requests
+"""Strategy Lab backend (Flask). Run: python app.py   then open http://127.0.0.1:5000"""
+import bisect
+import csv
 import io
+import json
+import os
+import re
+import subprocess
+import sys
+import uuid
+from contextlib import closing
 
-st.set_page_config(
-    page_title="PineToPy",
-    page_icon="🌲"
-)
-st.title("🌲 PineToPy")
-st.write("Fix for CSV + Live Fetch")
+from flask import Flask, Response, abort, jsonify, request, send_from_directory
 
-pine_code = st.text_area(
-    "Paste Pine Script here:",
-    height=250
-)
+import db
+import engine
+import library
+from templates import TEMPLATES
 
-# --- HELPER: FIX CSV ---
-def clean_csv(df_raw):
-    df = df_raw.copy()
-    # 1. Lowercase + strip columns
-    new_cols = []
-    for c in df.columns:
-        cc = str(c).strip().lower()
-        cc = cc.replace(" ", "_")
-        new_cols.append(cc)
-    df.columns = new_cols
-    # 2. Rename common names
-    rename_map = {}
-    for c in df.columns:
-        if c in ["date", "datetime", "timestamp", "time"]:
-            rename_map[c] = "time"
-        if c in ["open", "o"]:
-            rename_map[c] = "open"
-        if c in ["high", "h"]:
-            rename_map[c] = "high"
-        if c in ["low", "l"]:
-            rename_map[c] = "low"
-        if c in ["close", "c", "price", "adj_close", "adjclose"]:
-            rename_map[c] = "close"
-        if c in ["volume", "vol", "v"]:
-            rename_map[c] = "volume"
-    df = df.rename(columns=rename_map)
-    # 3. If only 1 price col, use it as close
-    if "close" not in df.columns:
-        for c in df.columns:
-            if "price" in c or "close" in c:
-                df["close"] = df[c]
-    # 4. Make OHLC if missing
-    if "close" in df.columns:
-        if "open" not in df.columns:
-            df["open"] = df["close"]
-        if "high" not in df.columns:
-            df["high"] = df["close"]
-        if "low" not in df.columns:
-            df["low"] = df["close"]
-        if "volume" not in df.columns:
-            df["volume"] = 0
-    # 5. Convert to numbers
-    for col in ["open", "high", "low", "close", "volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["close"])
-    # 6. Parse time
-    if "time" in df.columns:
-        df["time"] = pd.to_datetime(
-            df["time"], errors="coerce", utc=True
-        )
-        df = df.dropna(subset=["time"])
+BASE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(BASE, "data")
+PORT = int(os.environ.get("LAB_PORT", "5000"))
+HOSTS = {"127.0.0.1:%d" % PORT, "localhost:%d" % PORT}
+WORKER = os.path.join(BASE, "worker.py")
+os.makedirs(DATA, exist_ok=True)
+
+app = Flask(__name__, static_folder="static", static_url_path="/static")
+app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024  # 300 MB per upload
+app.json.sort_keys = False
+app.teardown_appcontext(db.close)
+
+db.init()
+with closing(db.raw_conn()) as _con:
+    library.migrate_old(_con)  # pulls v1 datasets into the new candle table
+    if _con.execute("SELECT 1 FROM strategies LIMIT 1").fetchone() is None:
+        _t = TEMPLATES[0]
+        _con.execute("INSERT INTO strategies(name, code, params) VALUES (?,?,?)",
+                     (_t["name"], _t["code"], json.dumps(engine.Strategy(_t["code"]).defs)))
+        _con.commit()
+
+
+# ---------------- security ----------------
+@app.before_request
+def protect():
+    """This app can run code, so refuse other websites and DNS-rebinding tricks."""
+    if request.host not in HOSTS:
+        abort(403)
+    if request.method not in ("GET", "HEAD") and request.headers.get("X-Lab") != "1":
+        abort(403)
+
+
+class CodeError(ValueError):
+    def __init__(self, msg, line=None, log=""):
+        super().__init__(msg)
+        self.line, self.log = line, log
+
+
+@app.errorhandler(CodeError)
+def on_code_error(e):
+    return jsonify(error=str(e), line=e.line, log=e.log), 400
+
+
+@app.errorhandler(ValueError)
+def on_value_error(e):
+    return jsonify(error=str(e)), 400
+
+
+@app.errorhandler(LookupError)
+def on_not_found(e):
+    return jsonify(error=str(e)), 404
+
+
+@app.errorhandler(403)
+def on_forbidden(_e):
+    return jsonify(error="Blocked: requests must come from the Strategy Lab page"), 403
+
+
+@app.errorhandler(413)
+def on_too_large(_e):
+    return jsonify(error="File too large (limit is 300 MB)"), 413
+
+
+# ---------------- helpers ----------------
+def call_worker(req, timeout):
+    """Run user code in a separate process; returns its JSON answer plus its console output."""
+    req["db"] = db.DB_PATH
+    try:
+        p = subprocess.run([sys.executable, WORKER], input=json.dumps(req), capture_output=True,
+                           text=True, encoding="utf-8", timeout=timeout, cwd=BASE)
+    except subprocess.TimeoutExpired:
+        raise CodeError("The strategy ran longer than %d seconds and was stopped." % timeout)
+    log = (p.stderr or "")[-4000:]
+    lines = (p.stdout or "").strip().splitlines()
+    if not lines:
+        raise CodeError("The strategy process crashed.", log=log)
+    out = json.loads(lines[-1])
+    out["log"] = log
+    return out
+
+
+def need_ok(out):
+    if not out.get("ok"):
+        raise CodeError(out.get("error", "Strategy failed"), out.get("line"), out.get("log", ""))
+    return out
+
+
+def dataset_or_404(ds_id):
+    ds = db.query("SELECT * FROM datasets WHERE id = ?", (ds_id,), one=True)
+    if ds is None:
+        raise LookupError("Dataset not found")
+    return ds
+
+
+def ds_json(r):
+    d = dict(r)
+    d["meta"] = json.loads(d["meta"]) if d.get("meta") else {}
+    d.pop("path", None)
+    return d
+
+
+def strategy_row(sid):
+    row = db.query("SELECT * FROM strategies WHERE id = ?", (sid,), one=True)
+    if row is None:
+        raise LookupError("Strategy not found")
+    return row
+
+
+def strategy_json(r, with_code=False):
+    d = {"id": r["id"], "name": r["name"], "params": json.loads(r["params"]), "updated_at": r["updated_at"]}
+    if with_code:
+        d["code"] = r["code"]
+    return d
+
+
+def run_row(run_id):
+    row = db.query("SELECT * FROM runs WHERE id = ?", (run_id,), one=True)
+    if row is None:
+        raise LookupError("Run not found")
+    return row
+
+
+def run_json(row):
+    d = dict(row)
+    d["params"] = json.loads(d["params"])
+    d["result"] = json.loads(d["result"])
+    d["has_code"] = bool(d.pop("code", None))
+    return d
+
+
+# ---------------- pages ----------------
+@app.get("/")
+def index():
+    return send_from_directory(app.static_folder, "index.html")
+
+
+# ---------------- data library ----------------
+TF_ORDER = list(engine.TF_SECONDS)
+
+
+@app.get("/api/datasets")
+def list_datasets():
+    rows = [ds_json(r) for r in db.query("SELECT * FROM datasets")]
+    rows.sort(key=lambda d: (d["symbol"] or "", TF_ORDER.index(d["timeframe"]) if d["timeframe"] in TF_ORDER else 99))
+    return jsonify(rows)
+
+
+@app.post("/api/datasets")
+def upload_dataset():
+    f = request.files.get("file")
+    if f is None or not f.filename:
+        raise ValueError("Choose a CSV file to upload")
+    tmp = os.path.join(DATA, "upload_" + uuid.uuid4().hex + ".csv")
+    f.save(tmp)
+    try:
+        df = engine.load_csv(tmp)
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("Could not read that file as OHLC price data")
+    finally:
+        os.remove(tmp)
+    detected = engine.detect_timeframe(df)
+    symbol = (request.form.get("symbol") or "").strip().upper() or engine.guess_symbol(f.filename)
+    if not symbol or not re.fullmatch(r"[A-Z0-9#.]{2,20}", symbol):
+        raise ValueError("Could not read the symbol from the file name. Type it in the Symbol box.")
+    label = (request.form.get("timeframe") or "").strip().upper() or engine.guess_timeframe(f.filename) or detected
+    if label != detected:
+        raise ValueError("%s looks like %s data but is labelled %s" % (f.filename, detected, label))
+    return jsonify(library.add_bars(db.conn(), symbol, detected, df, "upload")), 201
+
+
+@app.post("/api/datasets/synthetic")
+def add_synthetic():
+    seed = int((request.get_json(silent=True) or {}).get("seed", 1))
+    return jsonify(library.add_bars(db.conn(), "RANDOM%d" % seed, "H1", engine.synthetic(seed=seed), "synthetic")), 201
+
+
+@app.delete("/api/datasets/<int:ds_id>")
+def delete_dataset(ds_id):
+    dataset_or_404(ds_id)
+    db.execute("DELETE FROM datasets WHERE id = ?", (ds_id,))  # candles cascade; past runs are kept
+    return jsonify(ok=True)
+
+
+@app.get("/api/datasets/<int:ds_id>/candles")
+def dataset_candles(ds_id):
+    dataset_or_404(ds_id)
+    start = max(0, request.args.get("start", 0, type=int))
+    count = min(5000, max(1, request.args.get("count", 2000, type=int)))
+    rows = db.conn().execute("SELECT ts, open, high, low, close FROM candles WHERE dataset_id = ? "
+                             "ORDER BY ts LIMIT ? OFFSET ?", (ds_id, count, start)).fetchall()
+    return jsonify(start=start, rows=[list(r) for r in rows])
+
+
+# ---------------- strategies (the code IDE) ----------------
+@app.get("/api/strategies")
+def list_strategies():
+    return jsonify([strategy_json(r) for r in db.query("SELECT * FROM strategies ORDER BY name COLLATE NOCASE")])
+
+
+@app.get("/api/strategies/templates")
+def strategy_templates():
+    return jsonify(TEMPLATES)
+
+
+@app.post("/api/strategies/check")
+def check_strategy():
+    b = request.get_json(silent=True) or {}
+    code = b.get("code")
+    if not isinstance(code, str) or not code.strip():
+        raise ValueError("Write some code first")
+    ds_id = b.get("dataset_id")
+    if ds_id:
+        dataset_or_404(ds_id)
+    out = call_worker({"op": "check", "code": code, "dataset_id": ds_id, "max_bars": 4000}, 90)
+    return jsonify(out)
+
+
+def save_strategy(sid, data):
+    name = (data.get("name") or "").strip()[:60] or "Untitled strategy"
+    code = data.get("code")
+    if not isinstance(code, str) or not code.strip():
+        raise ValueError("Strategy code is empty")
+    if len(code) > 200_000:
+        raise ValueError("Strategy code is too long")
+    info = call_worker({"op": "inspect", "code": code}, 30)
+    params = json.dumps(info["params"]) if info.get("ok") else None  # keep old params if the code is broken
+    if sid is None:
+        sid = db.execute("INSERT INTO strategies(name, code, params) VALUES (?,?,?)", (name, code, params or "[]"))
     else:
-        df["time"] = pd.date_range(
-            periods=len(df), end=pd.Timestamp.today()
-        )
-    df = df.sort_values("time")
-    df = df.reset_index(drop=True)
-    return df
+        strategy_row(sid)
+        db.execute("UPDATE strategies SET name = ?, code = ?, params = COALESCE(?, params), "
+                   "updated_at = CURRENT_TIMESTAMP WHERE id = ?", (name, code, params, sid))
+    return jsonify(strategy=strategy_json(strategy_row(sid), True), check=info)
 
-def try_read_csv(file_bytes):
-    # Try different delimiters
-    for sep in [",", ";", "\t", "|"]:
-        try:
-            file_bytes.seek(0)
-            df_try = pd.read_csv(
-                file_bytes, sep=sep, engine="python"
-            )
-            if len(df_try.columns) >= 2:
-                return clean_csv(df_try)
-        except Exception:
-            continue
-    return None
 
-# --- DATA SECTION ---
-st.subheader("📊 Data")
-tab1, tab2, tab3 = st.tabs(
-    ["Live Fetch", "Upload CSV", "Sample Data"]
-)
+@app.post("/api/strategies")
+def create_strategy():
+    return save_strategy(None, request.get_json(silent=True) or {}), 201
 
-if "df" not in st.session_state:
-    st.session_state["df"] = None
 
-with tab1:
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        symbol = st.selectbox(
-            "Coin",
-            ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
-        )
-    with c2:
-        interval = st.selectbox(
-            "Timeframe",
-            ["1d", "4h", "1h", "15m"]
-        )
-    with c3:
-        limit = st.slider("Candles", 100, 1000, 500)
-    if st.button("Fetch Live Data"):
-        st.info("Trying Binance -> Binance US -> Kraken...")
-        got = None
-        # Try 1: Binance Global
-        try:
-            url = "https://api.binance.com/api/v3/klines"
-            params = {
-                "symbol": symbol,
-                "interval": interval,
-                "limit": limit
-            }
-            r = requests.get(url, params=params, timeout=10)
-            data = r.json()
-            if isinstance(data, list):
-                cols = ["time", "open", "high", "low", "close",
-                        "volume", "ct", "qav", "trades",
-                        "tb", "tq", "ig"]
-                got = pd.DataFrame(data, columns=cols)
-                st.success("Fetched from Binance Global")
-        except Exception as e:
-            st.warning(f"Binance Global failed: {e}")
-        # Try 2: Binance US
-        if got is None:
-            try:
-                url2 = "https://api.binance.us/api/v3/klines"
-                params2 = {
-                    "symbol": symbol,
-                    "interval": interval,
-                    "limit": limit
-                }
-                r2 = requests.get(url2, params=params2, timeout=10)
-                data2 = r2.json()
-                if isinstance(data2, list):
-                    cols2 = ["time", "open", "high", "low", "close",
-                             "volume", "ct", "qav", "trades",
-                             "tb", "tq", "ig"]
-                    got = pd.DataFrame(data2, columns=cols2)
-                    st.success("Fetched from Binance US")
-            except Exception as e:
-                st.warning(f"Binance US failed: {e}")
-        # Try 3: Kraken via CoinGecko
-        if got is None:
-            try:
-                coin = symbol.replace("USDT", "").lower()
-                coin = coin.replace("btc", "bitcoin")
-                coin = coin.replace("eth", "ethereum")
-                coin = coin.replace("sol", "solana")
-                url3 = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart"
-                params3 = {"vs_currency": "usd", "days": "365"}
-                r3 = requests.get(url3, params=params3, timeout=15)
-                j3 = r3.json()
-                prices = j3["prices"]
-                got = pd.DataFrame(prices, columns=["time", "close"])
-                got["open"] = got["close"]
-                got["high"] = got["close"]
-                got["low"] = got["close"]
-                got["volume"] = 0
-                st.success("Fetched from CoinGecko fallback")
-            except Exception as e:
-                st.error(f"All live sources failed: {e}")
-                st.info("Use CSV or Sample Data tab instead")
-        if got is not None:
-            st.session_state["df"] = clean_csv(got)
+@app.get("/api/strategies/<int:sid>")
+def get_strategy(sid):
+    return jsonify(strategy_json(strategy_row(sid), True))
 
-with tab2:
-    uploaded = st.file_uploader(
-        "Upload your CSV - any format",
-        type=["csv", "txt"]
-    )
-    st.caption("Works with: Binance, TradingView, Yahoo, ; or ,")
-    if uploaded is not None:
-        try:
-            bytes_io = io.BytesIO(uploaded.getvalue())
-            df_fixed = try_read_csv(bytes_io)
-            if df_fixed is not None:
-                st.session_state["df"] = df_fixed
-                st.success(
-                    f"CSV fixed! {len(df_fixed)} rows"
-                )
-                st.write("Columns found:", list(df_fixed.columns))
-            else:
-                st.error("Could not read CSV. Check file.")
-        except Exception as e:
-            st.error(f"CSV error: {e}")
-            st.info("Tip: open CSV in Excel, save as CSV UTF-8")
 
-with tab3:
-    if st.button("Generate Sample Data Offline"):
-        np.random.seed(42)
-        n = 500
-        dates = pd.date_range(
-            end=pd.Timestamp.today(), periods=n
-        )
-        price = 60000.0
-        prices = []
-        for i in range(n):
-            price = price * (1 + np.random.randn() * 0.02)
-            prices.append(price)
-        close_s = pd.Series(prices)
-        df_new = pd.DataFrame()
-        df_new["time"] = dates
-        df_new["open"] = close_s
-        df_new["high"] = close_s * 1.01
-        df_new["low"] = close_s * 0.99
-        df_new["close"] = close_s
-        df_new["volume"] = 100
-        st.session_state["df"] = df_new
-        st.success("Sample data ready")
+@app.put("/api/strategies/<int:sid>")
+def update_strategy(sid):
+    return save_strategy(sid, request.get_json(silent=True) or {})
 
-df = st.session_state["df"]
-if df is not None:
-    st.dataframe(df.tail())
-    st.line_chart(df.set_index("time")["close"])
-else:
-    st.info("No data yet. Fetch live, upload CSV, or sample.")
 
-if st.button("Convert to Python"):
-    if not pine_code.strip():
-        st.warning("Paste Pine Script first")
-    else:
-        code = pine_code
-        is_v6 = "@version=6" in code
-        vlabel = "v6" if is_v6 else "v5"
-        code = re.sub(
-            r"//@version=.*",
-            "# Pine " + vlabel,
-            code
-        )
-        code = re.sub(
-            r"indicator\(.*?\)", "# Indicator", code
-        )
-        code = re.sub(
-            r"strategy\(.*?\)", "# Strategy", code
-        )
-        code = re.sub(
-            r"input\.int\(\s*(\d+).*?\)",
-            r"\1", code
-        )
-        code = re.sub(
-            r"input\.float\(\s*([\d\.]+).*?\)",
-            r"\1", code
-        )
-        code = code.replace(
-            "ta.sma(close,", "close.rolling(window="
-        )
-        code = code.replace(
-            "ta.ema(close,", "close.ewm(span="
-        )
-        code = code.replace(
-            "ta.rsi(close,", "RSI(close,"
-        )
-        code = code.replace(
-            "ta.change(close)", "close.diff()"
-        )
-        code = re.sub(
-            r"ta\.atr\(\s*([^\)]+)\)",
-            r"ATR(high, low, close, \1)", code
-        )
-        code = re.sub(
-            r"ta\.mom\(close,\s*([^\)]+)\)",
-            r"close.diff(\1)", code
-        )
-        code = re.sub(
-            r"ta\.macd\(close,\s*([^,]+),",
-            r"MACD(close, \1,", code
-        )
-        code = re.sub(
-            r"close\.rolling\(window=([^\)]+)\)",
-            r"close.rolling(window=\1).mean()", code
-        )
-        code = re.sub(
-            r"close\.ewm\(span=([^\)]+)\)",
-            r"close.ewm(span=\1, adjust=False).mean()", code
-        )
-        code = re.sub(
-            r"ta\.highest\(close,\s*([^\)]+)\)",
-            r"close.rolling(window=\1).max()", code
-        )
-        code = re.sub(
-            r"ta\.lowest\(close,\s*([^\)]+)\)",
-            r"close.rolling(window=\1).min()", code
-        )
-        code = re.sub(
-            r"ta\.bb\(close,\s*([^,]+),\s*([^\)]+)\)",
-            r"BB(close, \1, \2)", code
-        )
-        code = re.sub(r"plot\(.*\)", "# plot", code)
-        code = re.sub(r"hline\(.*\)", "# hline", code)
-        code = re.sub(
-            r"ta\.crossover\((.*?),\s*(.*?)\)",
-            r"(\1 > \2)", code
-        )
-        code = re.sub(
-            r"ta\.crossunder\((.*?),\s*(.*?)\)",
-            r"(\1 < \2)", code
-        )
-        code = code.replace(
-            "strategy.entry", "# strategy.entry"
-        )
-        code = code.replace(
-            "strategy.close", "# strategy.close"
-        )
-        code = code.replace("strategy.long", "LONG")
-        code = code.replace("strategy.short", "SHORT")
-        code = code.replace("true", "True")
-        code = code.replace("false", "False")
-        code = re.sub(r"\bna\b", "None", code)
-        code = code.replace("varip ", "")
-        code = code.replace("var ", "")
-        code = re.sub(
-            r"if\s*\((.*?)\)\s*", r"if \1:\n    ", code
-        )
-        code = code.replace(":=", "=")
+@app.delete("/api/strategies/<int:sid>")
+def delete_strategy(sid):
+    strategy_row(sid)
+    db.execute("DELETE FROM strategies WHERE id = ?", (sid,))
+    return jsonify(ok=True)
 
-        header = "# Converted by PineToPy\n"
-        header += "import pandas as pd\n"
-        header += "import numpy as np\n\n"
-        header += "def RSI(close, period=14):\n"
-        header += "    delta = close.diff()\n"
-        header += "    gain = delta.where(delta > 0, 0)\n"
-        header += "    gain = gain.rolling(period).mean()\n"
-        header += "    loss = -delta.where(delta < 0, 0)\n"
-        header += "    loss = loss.rolling(period).mean()\n"
-        header += "    rs = gain / loss\n"
-        header += "    return 100 - (100 / (1 + rs))\n\n"
-        header += "def ATR(high, low, close, period=14):\n"
-        header += "    a = high - low\n"
-        header += "    b = (high - close.shift(1)).abs()\n"
-        header += "    c = (low - close.shift(1)).abs()\n"
-        header += "    tr = pd.concat([a, b, c], axis=1).max(axis=1)\n"
-        header += "    return tr.rolling(period).mean()\n\n"
-        header += "def MACD(close, fast=12, slow=26, sig=9):\n"
-        header += "    ef = close.ewm(span=fast).mean()\n"
-        header += "    es = close.ewm(span=slow).mean()\n"
-        header += "    m = ef - es\n"
-        header += "    s = m.ewm(span=sig).mean()\n"
-        header += "    return m, s, m - s\n\n"
-        header += "def BB(close, period=20, mult=2):\n"
-        header += "    basis = close.rolling(period).mean()\n"
-        header += "    dev = close.rolling(period).std()\n"
-        header += "    up = basis + mult * dev\n"
-        header += "    dn = basis - mult * dev\n"
-        header += "    return up, basis, dn\n\n"
-        final = header + code
-        st.success("Converted " + vlabel)
-        st.code(final, language="python")
-        st.download_button(
-            "Download .py", final,
-            file_name="converted.py"
-        )
-        if df is not None and "close" in df.columns:
-            st.subheader("📈 Backtest")
-            close = df["close"]
-            high = df["high"]
-            low = df["low"]
 
-            def RSI_fn(c, period=14):
-                delta = c.diff()
-                g = delta.where(delta > 0, 0)
-                g = g.rolling(period).mean()
-                l = -delta.where(delta < 0, 0)
-                l = l.rolling(period).mean()
-                rs = g / l
-                return 100 - (100 / (1 + rs))
+# ---------------- runs ----------------
+@app.post("/api/runs")
+def create_run():
+    b = request.get_json(silent=True) or {}
+    ds = dataset_or_404(b.get("dataset_id"))
+    strat = strategy_row(b.get("strategy_id"))
+    try:
+        cost, split = float(b.get("cost", 0.35)), float(b.get("split", 0.7))
+    except (TypeError, ValueError):
+        raise ValueError("Cost and split must be numbers")
+    mode = b.get("mode", "validate")
+    if not 0 <= cost <= 1000:
+        raise ValueError("Cost must be between 0 and 1000")
+    if not 0.3 <= split <= 0.9:
+        raise ValueError("In-sample share must be between 30% and 90%")
+    if mode not in ("quick", "validate"):
+        raise ValueError("Unknown mode")
 
-            def ATR_fn(h, l, c, period=14):
-                a = h - l
-                b = (h - c.shift(1)).abs()
-                cc = (l - c.shift(1)).abs()
-                tr = pd.concat([a, b, cc], axis=1).max(axis=1)
-                return tr.rolling(period).mean()
+    out = need_ok(call_worker({"op": "run", "code": strat["code"], "dataset_id": ds["id"],
+                               "params": b.get("params") or {}, "cost": cost, "split": split,
+                               "mode": mode}, 1800))
+    res = out["result"]
+    trades, chosen = res.pop("trades"), res["chosen"]
+    run_id = db.execute(
+        "INSERT INTO runs(dataset_id, dataset_name, strategy_id, strategy_name, strategy_type, mode, params, "
+        "cost, split, verdict, oos_exp, oos_n, result, code) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (ds["id"], ds["name"], strat["id"], strat["name"], "custom", mode, json.dumps(chosen["params"]),
+         cost, split, res["verdict"], chosen["oos"]["exp"], chosen["oos"]["n"], json.dumps(res), strat["code"]))
+    db.executemany(
+        "INSERT INTO trades(run_id, ts_entry, ts_exit, side, entry, exit, r, segment, sl, tp) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)", [[run_id] + t for t in trades])
+    j = run_json(run_row(run_id))
+    j["log"] = out["log"]
+    return jsonify(j), 201
 
-            def MACD_fn(c, fast=12, slow=26, sig=9):
-                ef = c.ewm(span=fast).mean()
-                es = c.ewm(span=slow).mean()
-                m = ef - es
-                s = m.ewm(span=sig).mean()
-                return m, s, m - s
 
-            def BB_fn(c, period=20, mult=2):
-                basis = c.rolling(period).mean()
-                dev = c.rolling(period).std()
-                up = basis + mult * dev
-                dn = basis - mult * dev
-                return up, basis, dn
+@app.get("/api/runs")
+def list_runs():
+    rows = db.query("SELECT id, created_at, dataset_name, strategy_name, mode, verdict, oos_exp, oos_n, params "
+                    "FROM runs ORDER BY id DESC LIMIT 200")
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["params"] = json.loads(d["params"])
+        out.append(d)
+    return jsonify(out)
 
-            env = {}
-            env["pd"] = pd
-            env["np"] = np
-            env["close"] = close
-            env["high"] = high
-            env["low"] = low
-            env["LONG"] = 1
-            env["SHORT"] = -1
-            env["RSI"] = RSI_fn
-            env["ATR"] = ATR_fn
-            env["MACD"] = MACD_fn
-            env["BB"] = BB_fn
-            exec(code, env)
-            sig_series = None
-            if "longCondition" in env:
-                if "shortCondition" in env:
-                    lc = env["longCondition"].fillna(False)
-                    sc = env["shortCondition"].fillna(False)
-                    sig_series = np.where(lc, 1, 0)
-                    sig_series = np.where(sc, -1, sig_series)
-            elif "rsi" in env:
-                rv = env["rsi"]
-                sig_series = np.where(rv < 30, 1, 0)
-                sig_series = np.where(rv > 70, -1, sig_series)
-            if sig_series is not None:
-                pos = pd.Series(sig_series, index=df.index)
-                pos = pos.replace(0, np.nan)
-                pos = pos.ffill().fillna(0)
-                pos = pos.clip(lower=0)
-                rets = close.pct_change().fillna(0)
-                srets = pos.shift(1).fillna(0) * rets
-                eq = (1 + srets).cumprod() * 10000
-                bh = (1 + rets).cumprod() * 10000
-                tr_ret = (eq.iloc[-1] / 10000 - 1) * 100
-                bh_ret = (bh.iloc[-1] / 10000 - 1) * 100
-                trades = int((pos.diff() != 0).sum())
-                nz = srets[srets != 0]
-                if len(nz) > 0:
-                    wr = float((nz > 0).mean() * 100)
-                else:
-                    wr = 0
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Strategy", f"{tr_ret:.2f}%")
-                m2.metric("Buy Hold", f"{bh_ret:.2f}%")
-                m3.metric("Trades", trades)
-                m4.metric("Win Rate", f"{wr:.1f}%")
-                cdf = pd.DataFrame(
-                    {"Strategy": eq, "Buy Hold": bh}
-                )
-                st.line_chart(cdf)
-            else:
-                st.info("No signal found")
-        else:
-            st.info("Load data first")
+
+@app.get("/api/runs/<int:run_id>")
+def get_run(run_id):
+    return jsonify(run_json(run_row(run_id)))
+
+
+@app.delete("/api/runs/<int:run_id>")
+def delete_run(run_id):
+    run_row(run_id)
+    db.execute("DELETE FROM runs WHERE id = ?", (run_id,))  # trades cascade
+    return jsonify(ok=True)
+
+
+@app.get("/api/runs/<int:run_id>/trades.csv")
+def run_trades_csv(run_id):
+    run_row(run_id)
+    rows = db.query("SELECT ts_entry, ts_exit, side, entry, exit, r, segment, sl, tp FROM trades "
+                    "WHERE run_id = ? ORDER BY id", (run_id,))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["entry_time", "exit_time", "side", "entry", "exit", "r_multiple", "segment", "stop", "target"])
+    for r in rows:
+        w.writerow(list(r))
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=run_%d_trades.csv" % run_id})
+
+
+# ---------------- visual replay ----------------
+@app.get("/api/runs/<int:run_id>/replay")
+def run_replay(run_id):
+    run = run_row(run_id)
+    if run["dataset_id"] is None:
+        raise ValueError("The data for this run was deleted, so it cannot be replayed")
+    ds = dataset_or_404(run["dataset_id"])
+    ts = [r[0] for r in db.conn().execute("SELECT ts FROM candles WHERE dataset_id = ? ORDER BY ts", (ds["id"],))]
+    trades = []
+    for r in db.query("SELECT ts_entry, ts_exit, side, entry, exit, r, segment, sl, tp FROM trades "
+                      "WHERE run_id = ? ORDER BY id", (run_id,)):
+        i, j = bisect.bisect_left(ts, r["ts_entry"]), bisect.bisect_left(ts, r["ts_exit"])
+        if i < len(ts) and j < len(ts) and ts[i] == r["ts_entry"] and ts[j] == r["ts_exit"]:
+            trades.append({"i": i, "j": j, "side": r["side"], "entry": r["entry"], "exit": r["exit"],
+                           "r": r["r"], "seg": r["segment"], "sl": r["sl"], "tp": r["tp"]})
+    split_at = json.loads(run["result"]).get("split_at") or ""
+    return jsonify(run_id=run_id, dataset_id=ds["id"], symbol=ds["symbol"], timeframe=ds["timeframe"],
+                   n_bars=len(ts), split_idx=bisect.bisect_left(ts, split_at), trades=trades,
+                   verdict=run["verdict"], strategy_name=run["strategy_name"] or "Trend Pullback")
+
+
+@app.get("/api/runs/<int:run_id>/plots")
+def run_plots(run_id):
+    run = run_row(run_id)
+    if run["dataset_id"] is None:
+        return jsonify(series={})
+    code = run["code"] or TEMPLATES[0]["code"]  # v1 runs had no code snapshot: they were Trend Pullback
+    out = need_ok(call_worker({"op": "plots", "code": code, "dataset_id": run["dataset_id"],
+                               "params": json.loads(run["params"])}, 120))
+    return jsonify(series=out["series"])
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=PORT, debug=False)
