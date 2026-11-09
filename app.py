@@ -35,7 +35,6 @@ if st.button("📡 Fetch Live Data"):
     except Exception as e:
         st.error(f"Failed to fetch: {e}. Binance might be blocked, try CSV below.")
 
-# Fallback CSV still works
 if "df" not in st.session_state:
     st.session_state["df"] = None
 
@@ -47,7 +46,10 @@ if uploaded is not None:
 df = st.session_state["df"]
 if df is not None:
     st.dataframe(df.tail())
-    st.line_chart(df.set_index("time")["close"] if "time" in df.columns else df["close"])
+    if "time" in df.columns:
+        st.line_chart(df.set_index("time")["close"])
+    else:
+        st.line_chart(df["close"])
 
 if st.button("Convert to Python"):
     if not pine_code.strip():
@@ -73,69 +75,4 @@ if st.button("Convert to Python"):
         code = re.sub(r'ta\.macd\(close,\s*([^,]+),\s*([^,]+),\s*([^\)]+)\)', r'MACD(close, \1, \2, \3)', code)
         code = re.sub(r'ta\.bb\(close,\s*([^,]+),\s*([^\)]+)\)', r'BB(close, \1, \2)', code)
         code = re.sub(r'close\.rolling\(window=\s*([^\)]+)\)', r'close.rolling(window=\1).mean()', code)
-        code = re.sub(r'close\.ewm\(span=\s*([^\)]+)\)', r'close.ewm(span=\1, adjust=False).mean()', code)
-        code = re.sub(r'ta\.highest\(close,\s*([^\)]+)\)', r'close.rolling(window=\1).max()', code)
-        code = re.sub(r'ta\.lowest\(close,\s*([^\)]+)\)', r'close.rolling(window=\1).min()', code)
-        code = re.sub(r'request\.security\(.*?\)', '# request.security - load data separately', code)
-        code = re.sub(r'plot\(.*\)', '# plot', code)
-        code = re.sub(r'plotshape\(.*\)', '# plotshape', code)
-        code = re.sub(r'hline\(.*\)', '# hline', code)
-        code = re.sub(r'bgcolor\(.*\)', '# bgcolor', code)
-        code = code.replace("ta.crossover(fast, slow)", "(fast > slow) & (fast.shift(1) <= slow.shift(1))")
-        code = code.replace("ta.crossunder(fast, slow)", "(fast < slow) & (fast.shift(1) >= slow.shift(1))")
-        code = re.sub(r'ta\.crossover\((.*?),\s*(.*?)\)', r'(\1 > \2) & (\1.shift(1) <= \2.shift(1))', code)
-        code = re.sub(r'ta\.crossunder\((.*?),\s*(.*?)\)', r'(\1 < \2) & (\1.shift(1) >= \2.shift(1))', code)
-        code = code.replace("strategy.entry", "# strategy.entry")
-        code = code.replace("strategy.close", "# strategy.close")
-        code = code.replace("strategy.exit", "# strategy.exit")
-        code = code.replace("strategy.long", "LONG")
-        code = code.replace("strategy.short", "SHORT")
-        code = code.replace("strategy.position_size", "position_size")
-        code = re.sub(r'alert\(.*\)', '# alert', code)
-        code = re.sub(r'label\.new\(.*\)', '# label.new', code)
-        code = re.sub(r'line\.new\(.*\)', '# line.new', code)
-        code = code.replace("true", "True").replace("false", "False")
-        code = re.sub(r'\bna\b', 'None', code)
-        code = re.sub(r'color\.\w+', 'blue', code)
-        code = code.replace("varip ", "")
-        code = code.replace("var ", "")
-        code = re.sub(r'if\s*\((.*?)\)\s*', r'if \1:\n    ', code)
-        code = code.replace(":=", "=")
-
-        header = "# Converted by PineToPy - " + version_label + " to Python\nimport pandas as pd\nimport numpy as np\n\n# df = pd.read_csv('data.csv')\n# close = df['close']\n\ndef RSI(close, period=14):\n    delta = close.diff()\n    gain = delta.where(delta > 0, 0).rolling(window=period).mean()\n    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()\n    rs = gain / loss\n    return 100 - (100 / (1 + rs))\n\ndef ATR(high, low, close, period=14):\n    tr = pd.concat([high-low, (high-close.shift(1)).abs(), (low-close.shift(1)).abs()], axis=1).max(axis=1)\n    return tr.rolling(window=period).mean()\n\ndef MACD(close, fast=12, slow=26, signal=9):\n    ema_fast = close.ewm(span=fast, adjust=False).mean()\n    ema_slow = close.ewm(span=slow, adjust=False).mean()\n    macd = ema_fast - ema_slow\n    sig = macd.ewm(span=signal, adjust=False).mean()\n    return macd, sig, macd - sig\n\ndef BB(close, period=20, mult=2):\n    basis = close.rolling(window=period).mean()\n    dev = close.rolling(window=period).std()\n    upper = basis + mult * dev\n    lower = basis - mult * dev\n    return upper, basis, lower\n\n"
-        final_code = header + code
-        st.success("Converted! Detected " + version_label)
-        st.code(final_code, language="python")
-        st.download_button("Download .py file", final_code, file_name="converted.py")
-
-        if df is not None and 'close' in df.columns:
-            st.subheader("📈 Live Backtest Result")
-            close = df['close']
-            high = df['high'] if 'high' in df.columns else close
-            low = df['low'] if 'low' in df.columns else close
-
-            def RSI_fn(c, period=14):
-                delta = c.diff()
-                gain = delta.where(delta > 0, 0).rolling(window=period).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-                rs = gain / loss
-                return 100 - (100 / (1 + rs))
-            def ATR_fn(h, l, c, period=14):
-                tr = pd.concat([h-l, (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
-                return tr.rolling(window=period).mean()
-            def MACD_fn(c, fast=12, slow=26, signal=9):
-                ef = c.ewm(span=fast, adjust=False).mean()
-                es = c.ewm(span=slow, adjust=False).mean()
-                m = ef - es
-                s = m.ewm(span=signal, adjust=False).mean()
-                return m, s, m - s
-            def BB_fn(c, period=20, mult=2):
-                basis = c.rolling(window=period).mean()
-                dev = c.rolling(window=period).std()
-                return basis + mult * dev, basis, basis - mult * dev
-
-            env = {'pd': pd, 'np': np, 'close': close, 'high': high, 'low': low, 'LONG': 1, 'SHORT': -1, 'RSI': RSI_fn, 'ATR': ATR_fn, 'MACD': MACD_fn, 'BB': BB_fn, 'position_size': 0}
-            exec(code, env)
-            signal_series = None
-            if 'longCondition' in env and 'shortCondition' in env:
-                signal_series = np.where(env['longCondition'].fillna(False), 1,
+        code = re.sub(r'close\.ewm\(span=\s
